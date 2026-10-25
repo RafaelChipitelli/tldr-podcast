@@ -1,0 +1,7 @@
+.env
+episodes/
+voice-samples/
+voices.txt
+podcastfy_prompt.json
+*.log
+__pycache__/
