@@ -84,10 +84,27 @@ def allow_audited_hub_prompts():
     content_generator.hub.pull = pull
 
 
+def voice_wordless_turns():
+    # Edge TTS returns no audio for a turn with no words (Gemini sometimes writes a
+    # silent reaction like "..."), which kills the whole episode. Turns must keep
+    # alternating, so the turn is voiced as a short acknowledgement instead of dropped.
+    from podcastfy.tts.providers.edge import EdgeTTS
+
+    generate_audio = EdgeTTS.generate_audio
+
+    def generate(self, text, voice, model, voice2=None):
+        if not re.search(r"\w", text):
+            text = "Mm-hmm."
+        return generate_audio(self, text, voice, model, voice2)
+
+    EdgeTTS.generate_audio = generate
+
+
 def make_podcast(text, date):
     from podcastfy.client import generate_podcast
 
     allow_audited_hub_prompts()
+    voice_wordless_turns()
 
     conversation_config = {
         "podcast_name": "TLDR Daily",
