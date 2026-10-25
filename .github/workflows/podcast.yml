@@ -1,0 +1,81 @@
+name: TLDR Daily Podcast
+
+on:
+  schedule:
+    - cron: "5 * * * *"
+  workflow_dispatch:
+    inputs:
+      post:
+        description: Post to Discord (off generates the MP3 as an artifact only)
+        type: boolean
+        default: false
+      force:
+        description: Regenerate even if the latest edition was already posted
+        type: boolean
+        default: false
+
+concurrency:
+  group: podcast
+  cancel-in-progress: false
+
+jobs:
+  podcast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # last_edition.txt in the repo is only the seed; the real state lives in the cache,
+      # so posting never needs a commit to main.
+      - name: Restore last posted edition
+        uses: actions/cache/restore@v4
+        with:
+          path: last_edition.txt
+          key: tldr-state-${{ github.run_id }}
+          restore-keys: tldr-state-
+
+      - name: Check for a new edition
+        id: check
+        env:
+          FORCE: ${{ inputs.force || 'false' }}
+        run: |
+          latest=$(curl -fsSL https://tldr.tech/api/rss/tech | grep -oE 'https://tldr.tech/tech/[0-9-]+' | head -1 | sed 's#.*/##')
+          done=$(cat last_edition.txt)
+          echo "latest=$latest done=$done"
+          if [ "$latest" != "$done" ] || [ "$FORCE" = "true" ]; then
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "date=$latest" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        if: steps.check.outputs.new == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        if: steps.check.outputs.new == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Generate podcast
+        if: steps.check.outputs.new == 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          POST: ${{ github.event_name == 'schedule' || inputs.post }}
+        run: python tldr_podcast.py $( [ "$POST" = "true" ] && echo --post ) --force
+
+      - name: Upload episode
+        if: steps.check.outputs.new == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tldr-${{ steps.check.outputs.date }}
+          path: episodes/*.mp3
+          retention-days: 7
+
+      - name: Remember posted edition
+        if: steps.check.outputs.new == 'true' && (github.event_name == 'schedule' || inputs.post)
+        uses: actions/cache/save@v4
+        with:
+          path: last_edition.txt
+          key: tldr-state-${{ steps.check.outputs.date }}-${{ github.run_id }}
