@@ -67,12 +67,14 @@ jobs:
           POST: ${{ github.event_name == 'schedule' || inputs.post }}
         run: python tldr_podcast.py $( [ "$POST" = "true" ] && echo --post ) --force
 
-      - name: Upload episode
-        if: steps.check.outputs.new == 'true'
+      - name: Upload episode and transcript
+        if: always() && steps.check.outputs.new == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: tldr-${{ steps.check.outputs.date }}
-          path: episodes/*.mp3
+          name: tldr-${{ steps.check.outputs.date }}-${{ github.run_id }}
+          path: |
+            episodes/*.mp3
+            episodes/transcripts/*.txt
           retention-days: 7
 
       - name: Remember posted edition

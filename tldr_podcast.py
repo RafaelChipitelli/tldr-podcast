@@ -18,6 +18,7 @@ import argparse
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -84,18 +85,27 @@ def allow_audited_hub_prompts():
     content_generator.hub.pull = pull
 
 
-def voice_wordless_turns():
-    # Edge TTS returns no audio for a turn with no words (Gemini sometimes writes a
-    # silent reaction like "..."), which kills the whole episode. Turns must keep
-    # alternating, so the turn is voiced as a short acknowledgement instead of dropped.
+def resilient_turns():
+    # One turn Edge TTS won't voice used to kill the whole episode. A turn with no words
+    # (Gemini sometimes writes "...") never works, and other turns fail now and then for
+    # reasons we couldn't reproduce. Retry, then strip anything but plain text, then fall
+    # back to a short acknowledgement: turns must keep alternating, so none is dropped.
     from podcastfy.tts.providers.edge import EdgeTTS
 
     generate_audio = EdgeTTS.generate_audio
 
     def generate(self, text, voice, model, voice2=None):
-        if not re.search(r"\w", text):
-            text = "Mm-hmm."
-        return generate_audio(self, text, voice, model, voice2)
+        plain = re.sub(r"<[^>]+>|[^\w\s.,!?'-]", " ", text).strip()
+        attempts = [text, text, plain] if re.search(r"\w", text) else []
+        for i, attempt in enumerate(attempts):
+            try:
+                return generate_audio(self, attempt, voice, model, voice2)
+            except Exception as e:
+                print(f"TTS attempt {i + 1} failed for {attempt!r}: {e}", file=sys.stderr)
+                time.sleep(2)
+        if attempts:
+            print(f"Voicing {text!r} as an acknowledgement instead", file=sys.stderr)
+        return generate_audio(self, "Mm-hmm.", voice, model, voice2)
 
     EdgeTTS.generate_audio = generate
 
@@ -104,7 +114,7 @@ def make_podcast(text, date):
     from podcastfy.client import generate_podcast
 
     allow_audited_hub_prompts()
-    voice_wordless_turns()
+    resilient_turns()
 
     conversation_config = {
         "podcast_name": "TLDR Daily",
@@ -138,12 +148,22 @@ def make_podcast(text, date):
             "ending_message": "That's it for today. See you tomorrow!",
         },
     }
-    audio = generate_podcast(
-        text=text,
-        tts_model="edge",
-        conversation_config=conversation_config,
-        llm_model_name=os.environ.get("GEMINI_MODEL", "gemini-3.8-flash"),
-    )
+    # Free-tier Gemini models get overloaded (503) or rate limited (429) for hours at a
+    # time, so fall back to an older model rather than skip the day.
+    models = [os.environ.get("GEMINI_MODEL", "gemini-3.8-flash"), "gemini-3.5-flash"]
+    for model in dict.fromkeys(models):
+        try:
+            audio = generate_podcast(
+                text=text,
+                tts_model="edge",
+                conversation_config=conversation_config,
+                llm_model_name=model,
+            )
+            break
+        except Exception as e:
+            if not re.search(r"\b(429|503)\b", str(e)) or model == models[-1]:
+                raise
+            print(f"{model} unavailable ({str(e)[:80]}), trying the next model", file=sys.stderr)
     if not audio:
         sys.exit("Podcastfy returned no audio file")
     final = OUT_DIR / f"tldr-{date}.mp3"
