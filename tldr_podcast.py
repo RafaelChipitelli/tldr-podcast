@@ -148,8 +148,8 @@ def make_podcast(text, date):
             "ending_message": "That's it for today. See you tomorrow!",
         },
     }
-    # Free-tier Gemini models get overloaded (503) or rate limited (429) for hours at a
-    # time, so fall back to an older model rather than skip the day.
+    # Free-tier Gemini models fail in more ways than we can list (429, 503, 504 seen so
+    # far), sometimes for hours, so any failure falls back to an older model.
     models = [os.environ.get("GEMINI_MODEL", "gemini-3.8-flash"), "gemini-3.5-flash"]
     for model in dict.fromkeys(models):
         try:
@@ -161,9 +161,9 @@ def make_podcast(text, date):
             )
             break
         except Exception as e:
-            if not re.search(r"\b(429|503)\b", str(e)) or model == models[-1]:
+            if model == models[-1]:
                 raise
-            print(f"{model} unavailable ({str(e)[:80]}), trying the next model", file=sys.stderr)
+            print(f"{model} failed ({str(e)[:80]}), trying the next model", file=sys.stderr)
     if not audio:
         sys.exit("Podcastfy returned no audio file")
     final = OUT_DIR / f"tldr-{date}.mp3"
