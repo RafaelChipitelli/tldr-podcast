@@ -23,3 +23,8 @@ jobs:
 
       - name: Parse the latest edition
         run: python tldr_podcast.py --dry-run
+
+      - name: Test retries and fallbacks
+        run: |
+          pip install pytest
+          python -m pytest -q tests
