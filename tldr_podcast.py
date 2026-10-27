@@ -149,9 +149,14 @@ def make_podcast(text, date):
         },
     }
     # Free-tier Gemini models fail in more ways than we can list (429, 503, 504 seen so
-    # far), sometimes for hours, so any failure falls back to an older model.
-    models = [os.environ.get("GEMINI_MODEL", "gemini-3.8-flash"), "gemini-3.5-flash"]
-    for model in dict.fromkeys(models):
+    # far), sometimes for hours, so any failure falls back to an older model. The per-minute
+    # quota can hit both models back to back, so rounds are spaced a few minutes apart.
+    models = list(dict.fromkeys([os.environ.get("GEMINI_MODEL", "gemini-3.8-flash"), "gemini-3.5-flash"]))
+    attempts = [(round_, model) for round_ in range(4) for model in models]
+    for i, (round_, model) in enumerate(attempts):
+        if i and model == models[0]:
+            print(f"All models failed, waiting {90 * round_}s before round {round_ + 1}", file=sys.stderr)
+            time.sleep(90 * round_)
         try:
             audio = generate_podcast(
                 text=text,
@@ -161,9 +166,9 @@ def make_podcast(text, date):
             )
             break
         except Exception as e:
-            if model == models[-1]:
+            if i == len(attempts) - 1:
                 raise
-            print(f"{model} failed ({str(e)[:80]}), trying the next model", file=sys.stderr)
+            print(f"{model} failed ({str(e)[:80]}), trying again", file=sys.stderr)
     if not audio:
         sys.exit("Podcastfy returned no audio file")
     final = OUT_DIR / f"tldr-{date}.mp3"
