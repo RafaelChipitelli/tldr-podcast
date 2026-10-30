@@ -16,10 +16,17 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements-gemini.txt
 
-      - name: Import Podcastfy
-        run: python -c "import podcastfy.client"
+      - name: Import the Gemini writer
+        run: python -c "import gemini_writer, podcastfy.client"
 
-      - name: Parse the latest edition
-        run: python tldr_podcast.py --dry-run
+      - name: Fetch the latest edition
+        run: python tldr_podcast.py fetch
+
+      - name: Voice a two-turn transcript
+        run: |
+          mkdir -p episodes/ci
+          printf '<Person1>Welcome to TLDR Daily.</Person1>\n<Person2>Good to be here.</Person2>\n' > episodes/ci/transcript.txt
+          python tldr_podcast.py voice ci
+          test -s episodes/ci/tldr-ci.mp3

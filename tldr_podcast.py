@@ -1,47 +1,53 @@
 """Turn the latest TLDR Tech newsletter into a two-host podcast and post it to Discord.
 
+Claude writes the dialogue in a cloud routine (docs/episode-session.md). When the routine
+hasn't posted by the afternoon, GitHub Actions has Gemini write it instead
+(gemini_writer.py). Either way this script does the rest: it fetches the edition, voices
+the transcript and posts it.
+
 Config comes from environment variables or a .env file next to this script:
-  GEMINI_API_KEY       required, writes the script (Gemini free tier is enough)
-  GEMINI_MODEL         optional, defaults to gemini-3.8-flash
-  DISCORD_WEBHOOK_URL  optional, posts the MP3 to that channel
+  DISCORD_WEBHOOK_URL  needed by `post`
   HOST_VOICE           Edge TTS voice for the main host (Person1)
   COHOST_VOICE         Edge TTS voice for the co-host (Person2)
 
 Usage:
-  python tldr_podcast.py              # generate the latest edition locally, no posting
-  python tldr_podcast.py --post       # generate and post to Discord, skipped if already posted
-  python tldr_podcast.py --force      # regenerate even if already posted
-  python tldr_podcast.py --dry-run    # only print the cleaned newsletter text
+  python tldr_podcast.py fetch               # save the latest edition to episodes/DATE/
+  python tldr_podcast.py voice DATE          # episodes/DATE/transcript.txt -> tldr-DATE.mp3
+  python tldr_podcast.py post DATE           # post it, then record DATE as posted
+  python tldr_podcast.py post DATE --force   # post even if DATE was already posted
+
+`fetch` ends with one line, `new DATE` or `posted DATE`.
+
+The last posted edition lives in last_edition.txt on the editions-data branch, so the
+cloud routine and the Actions fallback see each other's posts.
 """
 
 import argparse
+import asyncio
+import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
 
+import edge_tts
 import feedparser
+import imageio_ffmpeg
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent
 RSS_URL = "https://tldr.tech/api/rss/tech"
-STATE_FILE = ROOT / "last_edition.txt"
 OUT_DIR = ROOT / "episodes"
+DATA_BRANCH = "editions-data"
+STATE_FILE = "last_edition.txt"
+IDENTITY = ["-c", "user.name=TLDR Daily", "-c", "user.email=tldr-daily@users.noreply.github.com"]
 DISCORD_MAX_BYTES = 10 * 1024 * 1024  # upload limit for servers without boosts
-
-# Podcastfy pulls its prompts from LangChain Hub, which langsmith now blocks by default.
-# These pinned commits were audited on 2026-10-25: plain ChatPromptTemplates, no models,
-# URLs or headers. Only these exact identifiers are allowed through.
-AUDITED_PROMPTS = {
-    "souzatharsis/podcastfy_multimodal_cleanmarkup:b2365f11",
-    "souzatharsis/podcastfy_longform:acfdbc91",
-    "souzatharsis/podcastfy_longform_clean:8c110a0b",
-    "souzatharsis/podcast_rewriter:8ee296fb",
-}
 
 load_dotenv(ROOT / ".env")
 
@@ -73,124 +79,113 @@ def newsletter_stories(url):
     return stories
 
 
-def allow_audited_hub_prompts():
-    from langsmith import Client
-    from podcastfy import content_generator
-
-    def pull(identifier, **_):
-        if identifier not in AUDITED_PROMPTS:
-            sys.exit(f"Refusing unaudited hub prompt {identifier}")
-        return Client().pull_prompt(identifier, dangerously_pull_public_prompt=True)
-
-    content_generator.hub.pull = pull
+def git(*args, stdin=None):
+    result = subprocess.run(["git", *args], cwd=ROOT, input=stdin, capture_output=True, text=True)
+    if result.returncode:
+        sys.exit(f"git {args[0]} failed: {result.stderr.strip()}")
+    return result.stdout.strip()
 
 
-def resilient_turns():
-    # One turn Edge TTS won't voice used to kill the whole episode. A turn with no words
-    # (Gemini sometimes writes "...") never works, and other turns fail now and then for
-    # reasons we couldn't reproduce. Retry, then strip anything but plain text, then fall
-    # back to a short acknowledgement: turns must keep alternating, so none is dropped.
-    from podcastfy.tts.providers.edge import EdgeTTS
-
-    generate_audio = EdgeTTS.generate_audio
-
-    def generate(self, text, voice, model, voice2=None):
-        plain = re.sub(r"<[^>]+>|[^\w\s.,!?'-]", " ", text).strip()
-        attempts = [text, text, plain] if re.search(r"\w", text) else []
-        for i, attempt in enumerate(attempts):
-            try:
-                return generate_audio(self, attempt, voice, model, voice2)
-            except Exception as e:
-                print(f"TTS attempt {i + 1} failed for {attempt!r}: {e}", file=sys.stderr)
-                time.sleep(2)
-        if attempts:
-            print(f"Voicing {text!r} as an acknowledgement instead", file=sys.stderr)
-        return generate_audio(self, "Mm-hmm.", voice, model, voice2)
-
-    EdgeTTS.generate_audio = generate
+def last_posted():
+    # A failed fetch must stop the run: reading it as "nothing posted" would post twice.
+    git("fetch", "-q", "origin", DATA_BRANCH)
+    return git("show", f"FETCH_HEAD:{STATE_FILE}")
 
 
-def make_podcast(text, date):
-    from podcastfy.client import generate_podcast
+def record_posted(date):
+    # Commit onto the data branch with plumbing, so the checkout is never switched. The
+    # cloud git proxy allows pushing a branch but not deleting one, which this never does.
+    # The parent is the FETCH_HEAD last_posted() just read, so a post from the other side
+    # in between makes this push fail instead of overwriting it.
+    blob = git("hash-object", "-w", "--stdin", stdin=f"{date}\n")
+    tree = git("mktree", stdin=f"100644 blob {blob}\t{STATE_FILE}\n")
+    commit = git(*IDENTITY, "commit-tree", tree, "-p", "FETCH_HEAD", "-m", f"Posted {date}")
+    git("push", "-q", "origin", f"{commit}:refs/heads/{DATA_BRANCH}")
 
-    allow_audited_hub_prompts()
-    resilient_turns()
 
-    conversation_config = {
-        "podcast_name": "TLDR Daily",
-        "podcast_tagline": f"Tech news for {date}",
-        "output_language": "English",
-        "conversation_style": ["calm", "conversational", "informative"],
-        "roles_person1": "main host who walks through each story",
-        "roles_person2": "co-host who asks questions and adds context",
-        "dialogue_structure": ["Introduction", "Story by story", "Wrap-up"],
-        "engagement_techniques": ["questions", "analogies"],
-        "creativity": 0.6,
-        "user_instructions": (
-            "Cover every story in the newsletter, one at a time. "
-            "Person1 does most of the talking and explains each story; "
-            "Person2 keeps to short questions and reactions. "
-            "Never mention sponsors, links or reading times."
-        ),
-        "text_to_speech": {
-            "default_tts_model": "edge",
-            "edge": {
-                "default_voices": {
-                    "question": os.environ.get("HOST_VOICE", "en-US-AvaMultilingualNeural"),
-                    "answer": os.environ.get("COHOST_VOICE", "en-US-GuyNeural"),
-                }
-            },
-            "output_directories": {
-                "transcripts": str(OUT_DIR / "transcripts"),
-                "audio": str(OUT_DIR),
-            },
-            "temp_audio_dir": str(OUT_DIR / "tmp") + os.sep,
-            "ending_message": "That's it for today. See you tomorrow!",
-        },
-    }
-    # Free-tier Gemini models fail in more ways than we can list (429, 503, 504 seen so
-    # far), sometimes for hours, so any failure falls back to an older model. The per-minute
-    # quota can hit both models back to back, so rounds are spaced a few minutes apart.
-    models = list(dict.fromkeys([os.environ.get("GEMINI_MODEL", "gemini-3.8-flash"), "gemini-3.5-flash"]))
-    attempts = [(round_, model) for round_ in range(4) for model in models]
-    for i, (round_, model) in enumerate(attempts):
-        if i and model == models[0]:
-            print(f"All models failed, waiting {90 * round_}s before round {round_ + 1}", file=sys.stderr)
-            time.sleep(90 * round_)
+def fetch():
+    url, title, date = latest_edition()
+    stories = newsletter_stories(url)
+    folder = OUT_DIR / date
+    folder.mkdir(parents=True, exist_ok=True)
+    edition = {"date": date, "title": title, "url": url, "stories": [t for t, _ in stories]}
+    (folder / "edition.json").write_text(json.dumps(edition, indent=1), encoding="utf-8")
+    text = "\n\n".join(f"{story_title}\n{body}" for story_title, body in stories)
+    (folder / "newsletter.txt").write_text(f"{title}\n{url}\n\n{text}\n", encoding="utf-8")
+    print(f"{len(stories)} stories in {folder}")
+    print(f"{'posted' if last_posted() == date else 'new'} {date}")
+
+
+def turns(transcript):
+    for person, text in re.findall(r"<Person([12])>(.*?)</Person\1>", transcript, re.DOTALL):
+        text = " ".join(re.sub(r"<[^>]+>", " ", text).split())
+        # A turn with no words (Gemini sometimes writes "...") makes Edge TTS fail.
+        if re.search(r"\w", text):
+            yield person, text
+
+
+def speak(text, voice, path):
+    # Edge TTS fails a turn now and then for reasons we couldn't reproduce. Retry, then
+    # strip anything but plain text. One bad turn is skipped rather than losing the episode.
+    plain = re.sub(r"[^\w\s.,!?'-]", " ", text)
+    for i, attempt in enumerate([text, text, plain]):
         try:
-            audio = generate_podcast(
-                text=text,
-                tts_model="edge",
-                conversation_config=conversation_config,
-                llm_model_name=model,
-            )
-            break
+            asyncio.run(edge_tts.Communicate(attempt, voice).save(str(path)))
+            return True
         except Exception as e:
-            if i == len(attempts) - 1:
-                raise
-            print(f"{model} failed ({str(e)[:80]}), trying again", file=sys.stderr)
-    if not audio:
-        sys.exit("Podcastfy returned no audio file")
-    final = OUT_DIR / f"tldr-{date}.mp3"
-    os.replace(audio, final)
-    return final
+            print(f"TTS attempt {i + 1} failed for {attempt[:60]!r}: {e}", file=sys.stderr)
+            time.sleep(2)
+    print(f"Skipping the turn {text[:60]!r}", file=sys.stderr)
+    return False
 
 
-def post_to_discord(mp3, title, url, date, stories):
+def voice(date):
+    folder = OUT_DIR / date
+    transcript = (folder / "transcript.txt").read_text(encoding="utf-8")
+    voices = {
+        "1": os.environ.get("HOST_VOICE", "en-US-AvaMultilingualNeural"),
+        "2": os.environ.get("COHOST_VOICE", "en-US-GuyNeural"),
+    }
+    lines = list(turns(transcript))
+    if not lines:
+        sys.exit("No <Person1>/<Person2> turns in the transcript")
+    mp3 = folder / f"tldr-{date}.mp3"
+    with tempfile.TemporaryDirectory() as tmp:
+        parts = []
+        for i, (person, text) in enumerate(lines):
+            part = Path(tmp) / f"{i:03}.mp3"
+            if speak(text, voices[person], part):
+                parts.append(part)
+        playlist = Path(tmp) / "parts.txt"
+        playlist.write_text("".join(f"file '{p.as_posix()}'\n" for p in parts), encoding="utf-8")
+        # Edge TTS returns every turn in the same format, so the parts join without re-encoding.
+        subprocess.run(
+            [imageio_ffmpeg.get_ffmpeg_exe(), "-v", "error", "-y", "-f", "concat", "-safe", "0",
+             "-i", str(playlist), "-c", "copy", str(mp3)],
+            check=True,
+        )
+    print(f"Voiced {len(parts)} of {len(lines)} turns into {mp3}")
+
+
+def post(date, force):
+    folder = OUT_DIR / date
+    edition = json.loads((folder / "edition.json").read_text(encoding="utf-8"))
+    mp3 = folder / f"tldr-{date}.mp3"
     webhook = os.environ.get("DISCORD_WEBHOOK_URL")
     if not webhook:
-        print("DISCORD_WEBHOOK_URL not set, skipping Discord")
-        return
+        sys.exit("DISCORD_WEBHOOK_URL is not set")
     if mp3.stat().st_size > DISCORD_MAX_BYTES:
         sys.exit(f"{mp3.name} is over Discord's 10 MB limit")
+    if last_posted() == date and not force:
+        sys.exit(f"{date} was already posted")
 
     day = datetime.strptime(date, "%Y-%m-%d")
     headline = f"## {day:%A, %B} {day.day}, {day.year}"
-    bullets = "\n\n".join(f"• {story_title}" for story_title, _ in stories)
+    bullets = "\n\n".join(f"• {story_title}" for story_title in edition["stories"])
     summary = f"{headline}\n\n{bullets}"
     embed = {
-        "title": f"TLDR Daily: {title}"[:256],
-        "url": url,
+        "title": f"TLDR Daily: {edition['title']}"[:256],
+        "url": edition["url"],
         "description": summary[:4096],
         "color": 0x5B6B7A,
     }
@@ -200,34 +195,26 @@ def post_to_discord(mp3, title, url, date, stories):
         r = requests.post(webhook, files={"file": (mp3.name, f, "audio/mpeg")}, timeout=120)
     r.raise_for_status()
     print("Posted to Discord")
+    record_posted(date)
+    print(f"Recorded {date} on {DATA_BRANCH}")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--force", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--post", action="store_true", help="post to Discord (off by default)")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("fetch")
+    commands.add_parser("voice").add_argument("date")
+    post_parser = commands.add_parser("post")
+    post_parser.add_argument("date")
+    post_parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
-    url, title, date = latest_edition()
-    stories = newsletter_stories(url)
-    text = "\n\n".join(f"{story_title}\n{body}" for story_title, body in stories)
-    if args.dry_run:
-        print(f"{title}\n{url}\n\n{text}")
-        return
-    if not args.force and STATE_FILE.exists() and STATE_FILE.read_text().strip() == date:
-        print(f"{datetime.now():%Y-%m-%d %H:%M} {date} already done")
-        return
-    print(f"{datetime.now():%Y-%m-%d %H:%M} found edition {date}")
-    if not os.environ.get("GEMINI_API_KEY"):
-        sys.exit("GEMINI_API_KEY is not set")
-
-    OUT_DIR.mkdir(exist_ok=True)
-    mp3 = make_podcast(text, date)
-    print(f"Saved {mp3}")
-    if args.post:
-        post_to_discord(mp3, title, url, date, stories)
-        STATE_FILE.write_text(date)
+    if args.command == "fetch":
+        fetch()
+    elif args.command == "voice":
+        voice(args.date)
+    else:
+        post(args.date, args.force)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,13 @@
-name: TLDR Daily Podcast
+name: TLDR Daily Podcast (fallback)
 
+# Claude writes and posts each episode in a cloud routine (docs/episode-session.md). This
+# workflow is the fallback: from a few hours after the routine's slot it checks hourly,
+# and when the latest edition isn't recorded as posted on the editions-data branch, Gemini
+# writes the episode instead. GitHub runs hourly schedules only every few hours, so the
+# window is wide.
 on:
   schedule:
-    - cron: "5 * * * *"
+    - cron: "5 15-23 * * 1-5"
   workflow_dispatch:
     inputs:
       post:
@@ -10,13 +15,16 @@ on:
         type: boolean
         default: false
       force:
-        description: Regenerate even if the latest edition was already posted
+        description: Regenerate and post even if the latest edition was already posted
         type: boolean
         default: false
 
 concurrency:
   group: podcast
   cancel-in-progress: false
+
+permissions:
+  contents: write # post records the edition on the editions-data branch
 
 jobs:
   podcast:
@@ -25,61 +33,51 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # last_edition.txt in the repo is only the seed; the real state lives in the cache,
-      # so posting never needs a commit to main.
-      - name: Restore last posted edition
-        uses: actions/cache/restore@v4
+      - uses: actions/setup-python@v5
         with:
-          path: last_edition.txt
-          key: tldr-state-${{ github.run_id }}
-          restore-keys: tldr-state-
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install the light dependencies
+        run: pip install -r requirements.txt
 
       - name: Check for a new edition
         id: check
         env:
           FORCE: ${{ inputs.force || 'false' }}
         run: |
-          latest=$(curl -fsSL https://tldr.tech/api/rss/tech | grep -oE 'https://tldr.tech/tech/[0-9-]+' | head -1 | sed 's#.*/##')
-          done=$(cat last_edition.txt)
-          echo "latest=$latest done=$done"
-          if [ "$latest" != "$done" ] || [ "$FORCE" = "true" ]; then
+          status=$(python tldr_podcast.py fetch | tail -1)
+          echo "$status"
+          if [ "${status%% *}" = "new" ] || [ "$FORCE" = "true" ]; then
             echo "new=true" >> "$GITHUB_OUTPUT"
           fi
-          echo "date=$latest" >> "$GITHUB_OUTPUT"
+          echo "date=${status#* }" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-python@v5
+      - name: Install Podcastfy
         if: steps.check.outputs.new == 'true'
-        with:
-          python-version: "3.12"
-          cache: pip
+        run: pip install -r requirements-gemini.txt
 
-      - name: Install dependencies
-        if: steps.check.outputs.new == 'true'
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg
-          pip install -r requirements.txt
-
-      - name: Generate podcast
+      - name: Write the transcript with Gemini
         if: steps.check.outputs.new == 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python gemini_writer.py "${{ steps.check.outputs.date }}"
+
+      - name: Voice it
+        if: steps.check.outputs.new == 'true'
+        run: python tldr_podcast.py voice "${{ steps.check.outputs.date }}"
+
+      - name: Post to Discord
+        if: steps.check.outputs.new == 'true' && (github.event_name == 'schedule' || inputs.post)
+        env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          POST: ${{ github.event_name == 'schedule' || inputs.post }}
-        run: python tldr_podcast.py $( [ "$POST" = "true" ] && echo --post ) --force
+          FORCE: ${{ inputs.force || 'false' }}
+        run: python tldr_podcast.py post "${{ steps.check.outputs.date }}" $( [ "$FORCE" = "true" ] && echo --force )
 
       - name: Upload episode and transcript
         if: always() && steps.check.outputs.new == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: tldr-${{ steps.check.outputs.date }}-${{ github.run_id }}
-          path: |
-            episodes/*.mp3
-            episodes/transcripts/*.txt
+          path: episodes/${{ steps.check.outputs.date }}/
           retention-days: 7
-
-      - name: Remember posted edition
-        if: steps.check.outputs.new == 'true' && (github.event_name == 'schedule' || inputs.post)
-        uses: actions/cache/save@v4
-        with:
-          path: last_edition.txt
-          key: tldr-state-${{ steps.check.outputs.date }}-${{ github.run_id }}
