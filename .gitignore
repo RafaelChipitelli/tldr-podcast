@@ -5,3 +5,4 @@ voices.txt
 podcastfy_prompt.json
 *.log
 __pycache__/
+.venv/
