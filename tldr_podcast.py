@@ -27,6 +27,7 @@ import asyncio
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -50,6 +51,14 @@ IDENTITY = ["-c", "user.name=TLDR Daily", "-c", "user.email=tldr-daily@users.nor
 DISCORD_MAX_BYTES = 10 * 1024 * 1024  # upload limit for servers without boosts
 
 load_dotenv(ROOT / ".env")
+
+# The cloud's egress proxy re-signs TLS with its own CA and points SSL_CERT_FILE (or
+# REQUESTS_CA_BUNDLE) at a bundle that includes it. Edge TTS verifies against certifi's
+# bundle only, so every turn failed there; give it that bundle, verification still on.
+# Unset on the PC and in Actions, so nothing changes there.
+CA_BUNDLE = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE")
+if CA_BUNDLE:
+    edge_tts.communicate._SSL_CTX = ssl.create_default_context(cafile=CA_BUNDLE)
 
 
 def latest_edition():
@@ -156,6 +165,8 @@ def voice(date):
             part = Path(tmp) / f"{i:03}.mp3"
             if speak(text, voices[person], part):
                 parts.append(part)
+        if not parts:
+            sys.exit(f"Edge TTS voiced none of the {len(lines)} turns; see the errors above")
         playlist = Path(tmp) / "parts.txt"
         playlist.write_text("".join(f"file '{p.as_posix()}'\n" for p in parts), encoding="utf-8")
         # Edge TTS returns every turn in the same format, so the parts join without re-encoding.

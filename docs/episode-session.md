@@ -23,9 +23,10 @@ If Rafael asks for a **dry run**, do steps 0 to 3 and stop: nothing is posted.
 
 ## 0. Set up
 
-    pip install -q -r requirements.txt
+    python -m pip install -q -r requirements.txt
 
-ffmpeg comes with it (`imageio-ffmpeg`), so nothing else is installed.
+`python -m pip`, because in the cloud a bare `pip` installs into another Python. ffmpeg
+comes with it (`imageio-ffmpeg`), so nothing else is installed.
 
 ## 1. Should it run?
 
@@ -53,8 +54,9 @@ headline and text. Write the episode as a conversation between two hosts:
 - Write for the ear: no markdown, emoji, bullet points, URLs or stage directions. Say
   symbols as words ("percent", "dollars"); "US$2" is "two US dollars". Model and product
   names as they are written are fine.
-- Each turn is one to four sentences. Aim for 1,200 to 1,600 words in all: 1,176 words
-  made 7.7 minutes of audio.
+- Each turn is one to four sentences. The length follows the newsletter: about one and a
+  half times its word count (`wc -w episodes/D/newsletter.txt`). Never pad to reach a
+  number; covering every story clearly matters more. 1,176 words made 7.7 minutes.
 
 The file holds only the turns, one per line, alternating and starting with Person1:
 
