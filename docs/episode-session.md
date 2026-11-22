@@ -79,6 +79,14 @@ It voices each turn with Edge TTS (Ava for Person1, Guy for Person2) and joins t
 times is skipped with a warning; if more than two are skipped, find what they share (an
 odd character, a very long turn), fix the transcript and run this step again.
 
+It takes about five minutes, longer than a shell call's timeout, so start it in the
+background and wait for the process to exit; a stray `TTS attempt N failed` line while it
+runs is the retry doing its job. Never stop it before it exits: its last line is the
+verdict. Never judge TLS or Edge TTS by calling `edge_tts` directly: `tldr_podcast.py`
+points it at the cloud proxy's CA, a bare call does not, so a bare call fails with
+`CERTIFICATE_VERIFY_FAILED` even when voicing works (that sank the 12/11/2026 episode).
+If `voice` itself exits with a TLS error, stop and say so in the summary.
+
 ## 4. Post
 
     python tldr_podcast.py post D
